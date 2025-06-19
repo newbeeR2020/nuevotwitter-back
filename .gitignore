@@ -63,3 +63,6 @@ logs/
 # その他ツール固有
 ########################################
 .firebase/
+
+# firebaseの鍵
+uttc-hackathon-9202d-d8e43cb09cc4.json
