@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 
 	firebase "firebase.google.com/go/v4"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 )
@@ -65,7 +67,10 @@ type TweetIn struct {
 func createTweet(w http.ResponseWriter, r *http.Request) {
 	uid := r.Context().Value("uid").(string)
 	var in TweetIn
-	_ = json.NewDecoder(r.Body).Decode(&in)
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	_, err := db.Exec(`
 		INSERT INTO tweets
@@ -113,12 +118,57 @@ func likeTweet(w http.ResponseWriter, r *http.Request) {
 	tid := mux.Vars(r)["id"]
 
 	tx, _ := db.Begin()
-	if _, err := tx.Exec(
-		`INSERT IGNORE INTO likes (user_id,tweet_id) VALUES (?,?)`, uid, tid); err == nil {
+	res, err := tx.Exec(
+		`INSERT IGNORE INTO likes (user_id,tweet_id) VALUES (?,?)`, uid, tid)
+	if err != nil {
+		tx.Rollback()
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	aff, _ := res.RowsAffected()
+	if aff == 1 {
 		tx.Exec(`UPDATE tweets SET like_count = like_count+1 WHERE id=?`, tid)
+		return
 	}
 	tx.Commit()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /api/tweets/{parentId}/reply
+func replyTweet(w http.ResponseWriter, r *http.Request) {
+	uid := r.Context().Value("uid").(string)
+	pid := mux.Vars(r)["parentId"]
+	var in TweetIn
+	_ = json.NewDecoder(r.Body).Decode(&in)
+
+	var convid string
+	if err := db.QueryRow(`SELECT conversation_id FROM tweets WHERE id=?`, pid).Scan(&convid); err != nil {
+		http.Error(w, "parent tweet not found", 404)
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO tweets
+		  (id,text,author_id,conversation_id,reply_to_id,quoted_id)
+		VALUES (UUID(),?,?,?,?,?)`,
+		in.Text, uid,
+		convid, pid, in.QuotedID); err != nil {
+		tx.Rollback()
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if _, err := tx.Exec(`
+		UPDATE tweets SET reply_count=reply_count+1 WHERE id=?`, pid); err != nil {
+		tx.Rollback()
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	tx.Commit()
+	w.WriteHeader(http.StatusCreated)
 }
 
 // ---------- ヘルパ ----------
@@ -134,14 +184,29 @@ func ifEmpty(cID string) string {
 func main() {
 	initDB()
 	initFirebase()
-
 	r := mux.NewRouter()
+	r.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "ok")
+	}).Methods("GET")
 	api := r.PathPrefix("/api").Subrouter()
 	api.Use(auth)
 	api.HandleFunc("/tweets", createTweet).Methods("POST")
 	api.HandleFunc("/tweets", listTweets).Methods("GET")
 	api.HandleFunc("/tweets/{id}/like", likeTweet).Methods("POST")
+	api.HandleFunc("/tweets/{parentId}/reply", replyTweet).Methods("POST")
+	cors := handlers.CORS(
+		handlers.AllowedOrigins([]string{
+			"http://localhost:5173",            // Vite dev server
+			"https://your-frontend.vercel.app", // 本番フロント
+		}),
+		handlers.AllowedMethods([]string{"GET", "POST", "OPTIONS"}),
+		handlers.AllowedHeaders([]string{
+			"Content-Type",
+			"Authorization",
+		}),
+		handlers.AllowCredentials(), // Cookie を使うなら
+	)
 
 	log.Println("listen :4000")
-	log.Fatal(http.ListenAndServe(":4000", r))
+	log.Fatal(http.ListenAndServe(":4000", cors(r)))
 }
