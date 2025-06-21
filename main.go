@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	firebase "firebase.google.com/go/v4"
 	_ "github.com/go-sql-driver/mysql"
@@ -33,7 +34,10 @@ func initDB() {
 // ---------- Firebase 初期化 ----------
 func initFirebase() {
 	var err error
-	fbApp, err = firebase.NewApp(context.Background(), nil)
+	cfg := &firebase.Config{
+		ProjectID: "uttc-hackathon-9202d",
+	}
+	fbApp, err = firebase.NewApp(context.Background(), cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -42,11 +46,20 @@ func initFirebase() {
 // ---------- 認証ミドルウェア ----------
 func auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		idToken := r.Header.Get("Authorization")[7:] // “Bearer …”
-		client, _ := fbApp.Auth(r.Context())
+		hdr := r.Header.Get("Authorization")
+		if !strings.HasPrefix(hdr, "Bearer ") {
+			http.Error(w, "unauth", http.StatusUnauthorized)
+			return
+		}
+		idToken := hdr[7:] // “Bearer …”
+		client, err := fbApp.Auth(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		token, err := client.VerifyIDToken(r.Context(), idToken)
 		if err != nil {
-			http.Error(w, "unauth", 401)
+			http.Error(w, "unauth", http.StatusUnauthorized)
 			return
 		}
 		ctx := context.WithValue(r.Context(), "uid", token.UID)
@@ -79,6 +92,7 @@ func createTweet(w http.ResponseWriter, r *http.Request) {
 		in.Text, uid,
 		ifEmpty(in.ConversationID), in.ReplyToID, in.QuotedID)
 	if err != nil {
+		log.Println("insert tweet:", err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -127,8 +141,12 @@ func likeTweet(w http.ResponseWriter, r *http.Request) {
 	}
 	aff, _ := res.RowsAffected()
 	if aff == 1 {
-		tx.Exec(`UPDATE tweets SET like_count = like_count+1 WHERE id=?`, tid)
-		return
+		if _, err := tx.Exec(`UPDATE tweets SET like_count = like_count+1 WHERE id=?`, tid); err != nil {
+			tx.Rollback()
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
 	}
 	tx.Commit()
 	w.WriteHeader(http.StatusNoContent)
@@ -196,8 +214,8 @@ func main() {
 	api.HandleFunc("/tweets/{parentId}/reply", replyTweet).Methods("POST")
 	cors := handlers.CORS(
 		handlers.AllowedOrigins([]string{
-			"http://localhost:5173",            // Vite dev server
-			"https://your-frontend.vercel.app", // 本番フロント
+			"http://localhost:5173",                 // Vite dev server
+			"https://nuevotwitter-front.vercel.app", // 本番フロント
 		}),
 		handlers.AllowedMethods([]string{"GET", "POST", "OPTIONS"}),
 		handlers.AllowedHeaders([]string{
@@ -207,6 +225,10 @@ func main() {
 		handlers.AllowCredentials(), // Cookie を使うなら
 	)
 
-	log.Println("listen :4000")
-	log.Fatal(http.ListenAndServe(":4000", cors(r)))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "4000"
+	}
+	log.Printf("listen :%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, cors(r)))
 }
